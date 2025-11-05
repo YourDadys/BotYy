@@ -1,216 +1,360 @@
 # bot.py
-# Pyrogram referral bot (polling mode) — single-file
-# Usage: python3 bot.py
-# NOTE: If you will push to public repo, replace BOT_TOKEN with a placeholder first.
+# Referral + Private-channel verification bot
+# - Uses Pyrogram (bot client).
+# - Optionally uses a Pyrogram "user" client (if API_ID/API_HASH provided)
+#   to detect pending join-requests. Without API_ID/API_HASH, only membership
+#   (accepted) can be detected via Bot API.
 
+import os
 import sqlite3
 import time
 import uuid
-import os
+import traceback
+
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ---------- CONFIG (edit here) ----------
-API_ID = 26343513               # replace with your api_id
-API_HASH = "12712c972da9bdf5225f63a628e1b7a3"  # replace with your api_hash
-BOT_TOKEN = "8536505559:AAHtlNxU0XS2FW4yw--0JXNA7OrZqkI4_W8"  # replace with your bot token (from BotFather)
-ADMIN_ID = 6743586157           # admin user id (change if needed)
-THRESHOLD = 5                   # referrals needed to get reward
+# ------------------------
+# CONFIG FROM ENV
+# ------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")                      # required
+CHANNEL_INVITE = os.getenv("CHANNEL_INVITE")            # required: the private invite link (e.g. https://t.me/+v448J7mpR8liMmRl)
+CHANNEL_ID = os.getenv("CHANNEL_ID")                    # optional numeric chat id like -100123...
+API_ID = os.getenv("API_ID")                            # optional (for user client)
+API_HASH = os.getenv("API_HASH")                        # optional (for user client)
+PORT = int(os.getenv("PORT", "8080"))
+
+if not BOT_TOKEN:
+    raise SystemExit("Missing BOT_TOKEN environment variable")
+if not CHANNEL_INVITE:
+    raise SystemExit("Missing CHANNEL_INVITE environment variable (private invite link)")
+
+# Normalize CHANNEL_ID if provided
+if CHANNEL_ID is not None and CHANNEL_ID.strip() == "":
+    CHANNEL_ID = None
+
+# ------------------------
+# DB setup
+# ------------------------
 DB_PATH = "referral.db"
-# ---------------------------------------
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    referrer_id INTEGER,
+    verified INTEGER DEFAULT 0,
+    started_at INTEGER
+);
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS referrals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    referrer_id INTEGER,
+    referred_id INTEGER,
+    ts INTEGER,
+    UNIQUE(referrer_id, referred_id)
+);
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS rewards (
+    user_id INTEGER PRIMARY KEY,
+    rewards INTEGER DEFAULT 0
+);
+""")
+conn.commit()
 
-if BOT_TOKEN.startswith("PUT_YOUR"):
-    print("WARNING: BOT_TOKEN is placeholder. Replace BOT_TOKEN in bot.py before running.")
-if not API_ID or not API_HASH:
-    print("WARNING: API_ID/API_HASH may be invalid or missing.")
+# ------------------------
+# Pyrogram bot client
+# ------------------------
+app = Client("ref-bot", bot_token=BOT_TOKEN)
 
-# ---------- DB helpers ----------
-def get_db_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Optional: pyrogram user client (MTProto) to inspect join-requests (if API_ID/API_HASH provided)
+user_client = None
+use_user_client = False
+if API_ID and API_HASH:
+    try:
+        user_client = Client("ref-user", api_id=int(API_ID), api_hash=API_HASH)
+        # We won't start it yet; we'll start after bot starts
+        use_user_client = True
+    except Exception as e:
+        print("Could not initialize user client (API_ID/API_HASH invalid?):", e)
+        user_client = None
+        use_user_client = False
 
-def init_db():
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        started_from INTEGER,
-        started_at INTEGER
-    );
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS referrals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        referrer_id INTEGER,
-        referred_id INTEGER,
-        ts INTEGER,
-        UNIQUE(referrer_id, referred_id)
-    );
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS rewards (
-        user_id INTEGER PRIMARY KEY,
-        rewarded INTEGER DEFAULT 0,
-        code TEXT
-    );
-    """)
-    conn.commit()
-    conn.close()
+# ------------------------
+# Helpers
+# ------------------------
+def gen_reward_code():
+    return "REWARD-" + uuid.uuid4().hex[:8].upper()
 
-init_db()
-
-# ---------- Utility ----------
-def gen_code():
-    return "REWARD-" + uuid.uuid4().hex[:10].upper()
-
-def get_bot_username(app: Client):
+def get_bot_username_sync():
     me = app.get_me()
-    return me.username if me and me.username else "your_bot"
+    return me.username if me and me.username else "bot"
 
-# ---------- Bot ----------
-app = Client("referral-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+def register_user(user_obj, ref_param=None):
+    """Insert user if new and register referral"""
+    uid = user_obj.id
+    username = user_obj.username
+    first_name = user_obj.first_name
 
-# When a new user clicks deep link: /start <param>
-@app.on_message(filters.command("start"))
-async def start_handler(client: Client, message: Message):
-    args = message.text.split()
-    uid = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name or ""
-
-    # store user if new
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id = ?", (uid,))
-    if cur.fetchone():
-        # existing user — update name/username if changed
+    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    existing = cur.fetchone()
+    if existing:
+        # update names
         cur.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?", (username, first_name, uid))
         conn.commit()
-    else:
-        # new user; may have started from ref param
-        started_from = None
-        if len(args) > 1:
-            param = args[1]
-            # support verify_ style tokens or numeric referrer id
-            if param.startswith("verify_"):
-                # not used for referrals here, skip
-                started_from = None
-            else:
-                if param.isdigit():
-                    started_from = int(param)
-                    if started_from == uid:
-                        started_from = None
-        ts = int(time.time())
-        cur.execute("INSERT INTO users (user_id, username, first_name, started_from, started_at) VALUES (?,?,?,?,?)",
-                    (uid, username, first_name, started_from, ts))
-        conn.commit()
+        return False  # not new
 
-        # if there is a valid referrer, register referral
-        if started_from:
-            # ensure referrer exists in users table
-            cur.execute("SELECT * FROM users WHERE user_id = ?", (started_from,))
-            if cur.fetchone():
-                cur.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, ts) VALUES (?,?,?)",
-                            (started_from, uid, ts))
-                conn.commit()
-                # check count and award if threshold reached
-                cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id = ?", (started_from,))
-                count = cur.fetchone()["c"]
-                if count >= THRESHOLD:
-                    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (started_from,))
-                    r = cur.fetchone()
-                    if not r or r["rewarded"] == 0:
-                        code = gen_code()
-                        cur.execute("INSERT OR REPLACE INTO rewards (user_id, rewarded, code) VALUES (?,?,?)",
-                                    (started_from, 1, code))
-                        conn.commit()
-                        try:
-                            await client.send_message(started_from, f"🎉 Congratulations! You reached {THRESHOLD} referrals.\nYour reward code: <b>{code}</b>")
-                        except Exception:
-                            pass
+    ref_id = None
+    if ref_param:
+        # param can be "ref_123" or just number
+        if isinstance(ref_param, str) and ref_param.startswith("ref_"):
+            ref_param = ref_param.replace("ref_", "")
+        if str(ref_param).isdigit():
+            candidate = int(ref_param)
+            if candidate != uid:
+                # verify referrer exists OR we'll still accept and create one (optional)
+                cur.execute("SELECT 1 FROM users WHERE user_id=?", (candidate,))
+                if cur.fetchone():
+                    ref_id = candidate
+                else:
+                    # allow even if not present (still count)
+                    ref_id = candidate
 
-    # reply to new or existing user with their referral link & status
-    cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id = ?", (uid,))
-    row = cur.fetchone()
-    count = row["c"] if row else 0
-    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (uid,))
-    rrow = cur.fetchone()
-    reward_msg = f"✅ Reward: {rrow['code']}" if rrow and rrow["rewarded"] else f"❌ No reward yet — get {THRESHOLD} referrals"
-    bot_username = (await client.get_me()).username
-    ref_link = f"https://t.me/{bot_username}?start={uid}"
-    await message.reply_text(
-        f"👋 Hi {first_name}!\n\n"
-        f"🔗 Your referral link:\n{ref_link}\n\n"
-        f"👥 Referrals: {count}/{THRESHOLD}\n"
-        f"{reward_msg}\n\n"
-        "Share your link. Unique users who click and start via your link count as referrals."
-    )
-    conn.close()
-
-# Admin: get stats
-@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
-async def stats_cmd(client: Client, message: Message):
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as u FROM users")
-    users = cur.fetchone()["u"]
-    cur.execute("SELECT COUNT(*) as r FROM referrals")
-    refs = cur.fetchone()["r"]
-    cur.execute("SELECT COUNT(*) as w FROM rewards WHERE rewarded=1")
-    rewarded = cur.fetchone()["w"]
-    conn.close()
-    await message.reply_text(f"📊 Stats:\nUsers: {users}\nReferrals recorded: {refs}\nRewards granted: {rewarded}")
-
-# Admin: grant reward manually
-@app.on_message(filters.command("grant") & filters.user(ADMIN_ID))
-async def grant_cmd(client: Client, message: Message):
-    # usage: /grant <user_id>
-    args = message.text.split()
-    if len(args) < 2:
-        await message.reply_text("Usage: /grant <user_id>")
-        return
-    try:
-        uid = int(args[1])
-    except ValueError:
-        await message.reply_text("Invalid user_id.")
-        return
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (uid,))
-    r = cur.fetchone()
-    if r and r["rewarded"]:
-        await message.reply_text("User already rewarded.")
-        conn.close()
-        return
-    code = gen_code()
-    cur.execute("INSERT OR REPLACE INTO rewards (user_id, rewarded, code) VALUES (?,?,?)", (uid, 1, code))
+    ts = int(time.time())
+    cur.execute("INSERT INTO users (user_id, username, first_name, referrer_id, verified, started_at) VALUES (?,?,?,?,0,?)",
+                (uid, username, first_name, ref_id, ts))
     conn.commit()
-    conn.close()
+
+    # Register referral mapping if referrer exists
+    if ref_id:
+        try:
+            cur.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, ts) VALUES (?,?,?)",
+                        (ref_id, uid, ts))
+            conn.commit()
+            # notify referrer
+            try:
+                app.send_message(ref_id,
+                                 f"🎯 Your referral joined: {first_name if first_name else username} (id: {uid})")
+            except Exception:
+                pass
+
+            # check reward threshold (5)
+            cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (ref_id,))
+            c = cur.fetchone()["c"]
+            if c >= 5:
+                # grant reward: increment rewards and subtract 5 referrals (or keep refs, but grant)
+                cur.execute("SELECT rewards FROM rewards WHERE user_id=?", (ref_id,))
+                row = cur.fetchone()
+                if row:
+                    newr = row["rewards"] + 1
+                    cur.execute("UPDATE rewards SET rewards=? WHERE user_id=?", (newr, ref_id))
+                else:
+                    cur.execute("INSERT INTO rewards (user_id, rewards) VALUES (?,?)", (ref_id, 1))
+                conn.commit()
+                # remove any 5 referrals if you want to reset counters: optional
+                # (here we keep referrals but reward is granted per every 5 total)
+                try:
+                    app.send_message(ref_id, f"🎉 Congratulations — you reached 5 referrals and earned 1 reward!")
+                except Exception:
+                    pass
+        except Exception as e:
+            print("Referral insert error:", e)
+
+    return True  # new user registered
+
+# ------------------------
+# Keyboards
+# ------------------------
+def keyboard_before_verify():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔗 Join Channel", url=CHANNEL_INVITE)],
+            [InlineKeyboardButton("✅ Verify (I sent request)", callback_data="verify")]
+        ]
+    )
+
+def keyboard_after_verify(user_id):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("👥 Check My Referrals", callback_data="check_refs")],
+            [InlineKeyboardButton("🎁 Claim Reward (5 refs = 1)", callback_data="claim_reward")]
+        ]
+    )
+
+# ------------------------
+# Utility: check membership via Bot API (works if accepted)
+# ------------------------
+def bot_check_membership(user_id):
     try:
-        await client.send_message(uid, f"🎁 Admin granted a reward: <b>{code}</b>")
+        # if CHANNEL_ID provided use it; else try to resolve via invite link (not always possible)
+        chat_identifier = CHANNEL_ID if CHANNEL_ID else CHANNEL_INVITE
+        member = app.get_chat_member(chat_identifier, user_id)
+        status = member.status  # 'member','left','administrator','creator','restricted','kicked'
+        return status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+# ------------------------
+# Utility: check pending requests via user_client (MTProto)
+# NOTE: This requires user_client to be started and bot account to have access to view join requests.
+# Pyrogram provides get_chat_join_requests only on user client (if available).
+# ------------------------
+async def userclient_check_request(user_id):
+    """
+    Returns:
+      - 'joined' if member
+      - 'pending' if a join request exists
+      - 'not' if no request found
+    """
+    # require user_client to be running
+    try:
+        # prefer numeric CHANNEL_ID if provided
+        if CHANNEL_ID:
+            chat = int(CHANNEL_ID)
+        else:
+            # resolve invite link -> chat id: pyrogram can resolve via get_chat
+            resolved = await user_client.get_chat(CHANNEL_INVITE)
+            chat = resolved.id
+    except Exception as e:
+        print("Could not resolve channel invite via user_client:", e)
+        return "not"
+
+    # check membership first
+    try:
+        member = await user_client.get_chat_member(chat, user_id)
+        if member and member.status in ("member", "administrator", "creator"):
+            return "joined"
     except Exception:
         pass
-    await message.reply_text(f"Granted reward to {uid}: {code}")
 
-# Optional: command to view own referrals (simple)
-@app.on_message(filters.command("myrefs"))
-async def myrefs(client: Client, message: Message):
-    uid = message.from_user.id
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id = ?", (uid,))
-    c = cur.fetchone()["c"]
-    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (uid,))
-    r = cur.fetchone()
-    reward = r["code"] if r and r["rewarded"] else None
-    conn.close()
-    await message.reply_text(f"👥 You have {c} referrals.\nReward: {reward if reward else 'Not yet'}")
+    # try to get join requests (Pyrogram exposes get_chat_join_requests on newer versions)
+    try:
+        # This may work if library exposes get_chat_join_requests
+        reqs = await user_client.get_chat_join_requests(chat)
+        if reqs:
+            for r in reqs:
+                if getattr(r, "user", None) and r.user.id == user_id:
+                    return "pending"
+    except Exception as e:
+        # Not all pyrogram versions expose this; fallback:
+        print("get_chat_join_requests error or not available:", e)
 
-# Run the bot
-if __name__ == "__main__":
-    print("✅ Referral bot (Pyrogram) starting...")
+    return "not"
+
+# ------------------------
+# Handlers
+# ------------------------
+@app.on_message(filters.command("start"))
+def on_start(client, message):
+    # register and maybe referral
+    arg = None
+    parts = message.text.split()
+    if len(parts) > 1:
+        arg = parts[1]
+
+    new = register_user(message.from_user, arg)
+
+    # show join + verify only
+    username = get_bot_username_sync()
+    ref_link = f"https://t.me/{username}?start={message.from_user.id}"
+    text = ("👋 Welcome!\n\n"
+            "Please join our private channel using the button below.\n"
+            "After you send a join request, come back and press Verify.\n\n"
+            f"🔗 Your referral link:\n{ref_link}\n\n")
+    message.reply(text, reply_markup=keyboard_before_verify())
+
+@app.on_callback_query(filters.regex("^verify$"))
+def on_verify(client, callback_query):
+    uid = callback_query.from_user.id
+    user_mention = callback_query.from_user.mention
+    # First try user_client method if available
+    if use_user_client and user_client is not None:
+        # run async check via user_client
+        try:
+            res = user_client.loop.run_until_complete(userclient_check_request(uid))
+            if res == "joined":
+                # mark verified
+                cur.execute("UPDATE users SET verified=1 WHERE user_id=?", (uid,))
+                conn.commit()
+                callback_query.message.edit_text("✅ Verified: you are a channel member.", reply_markup=keyboard_after_verify(uid))
+            elif res == "pending":
+                # mark verified as pending true? we can mark verified=0 but inform user
+                callback_query.answer("✅ Request found (pending). Verification will succeed once admin approves.", show_alert=True)
+                # Optionally set a flag pending; here we keep verified=0 until actual membership
+            else:
+                callback_query.answer("❌ No request found. Please open channel link and tap 'Join' (send request), then press Verify.", show_alert=True)
+        except Exception as e:
+            print("user_client verify error:", e)
+            traceback.print_exc()
+            callback_query.answer("❌ Could not check join requests (user client error).", show_alert=True)
+    else:
+        # fallback: check membership via Bot API (detects only accepted members)
+        is_member = bot_check_membership(uid)
+        if is_member:
+            cur.execute("UPDATE users SET verified=1 WHERE user_id=?", (uid,))
+            conn.commit()
+            callback_query.message.edit_text("✅ Verified: you are a channel member.", reply_markup=keyboard_after_verify(uid))
+        else:
+            callback_query.answer(
+                "❌ Could not detect join. If you have only sent a join request (pending) the bot cannot detect it without API_ID/API_HASH.\nPlease join the channel, send the join request, and if you provided API_ID/API_HASH the bot will detect pending requests; otherwise wait until admin accepts and then press Verify.",
+                show_alert=True
+            )
+
+@app.on_callback_query(filters.regex("^check_refs$"))
+def on_check_refs(client, callback_query):
+    uid = callback_query.from_user.id
+    cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,))
+    row = cur.fetchone()
+    count = row["c"] if row else 0
+    cur.execute("SELECT rewards FROM rewards WHERE user_id=?", (uid,))
+    row2 = cur.fetchone()
+    rewards = row2["rewards"] if row2 else 0
+    callback_query.answer()
+    callback_query.message.reply_text(f"👥 Your referrals: {count}\n🎁 Rewards: {rewards}")
+
+@app.on_callback_query(filters.regex("^claim_reward$"))
+def on_claim_reward(client, callback_query):
+    uid = callback_query.from_user.id
+    cur.execute("SELECT rewards FROM rewards WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row or row["rewards"] <= 0:
+        callback_query.answer("❌ You have no rewards to claim.", show_alert=True)
+        return
+    # decrement one reward and send reward code
+    code = gen_reward_code()
+    newr = row["rewards"] - 1
+    cur.execute("UPDATE rewards SET rewards=? WHERE user_id=?", (newr, uid))
+    conn.commit()
+    try:
+        app.send_message(uid, f"🎁 Reward claimed! Your code: <b>{code}</b>")
+    except Exception:
+        pass
+    callback_query.answer("✅ Reward claimed — check your messages.", show_alert=True)
+
+# Map callback data names used above to actual regex strings used
+# Note: our callback_data strings are "verify", "check_refs", "claim_reward"
+# Ensure inline buttons use these exact strings.
+
+# ------------------------
+# Start user_client if available and then start bot
+# ------------------------
+def start_both():
+    # If user_client available, start it (needed for join-request detection)
+    if use_user_client and user_client is not None:
+        try:
+            print("Starting user_client (MTProto) for pending-request checks...")
+            user_client.start()
+            print("user_client started.")
+        except Exception as e:
+            print("Could not start user_client:", e)
+
+    print("Starting bot (bot client)...")
     app.run()
+
+if __name__ == "__main__":
+    start_both()
