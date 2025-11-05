@@ -1,5 +1,8 @@
+*.session
+*.session-journal
+*.db
+*.db-journal
 __pycache__/
 *.pyc
-referral.db
 .env
 .DS_Store
