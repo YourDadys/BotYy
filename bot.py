@@ -1,215 +1,216 @@
 # bot.py
-# Telegram Referral Bot (Polling Mode + Dummy Web)
-# -----------------------------------------------
-# ✅ No webhook needed
-# ✅ Works 24x7 on Koyeb / Render
-# ✅ Dummy web on port 8080 (for uptime ping)
-# -----------------------------------------------
+# Pyrogram referral bot (polling mode) — single-file
+# Usage: python3 bot.py
+# NOTE: If you will push to public repo, replace BOT_TOKEN with a placeholder first.
 
-import os
+import sqlite3
 import time
 import uuid
-import threading
-import sqlite3
-import requests
-from flask import Flask, render_template_string
+import os
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
-# ---------- CONFIG ----------
-BOT_TOKEN = "8536505559:AAHtlNxU0XS2FW4yw--0JXNA7OrZqkI4_W8"  # ⚠️ Replace with your bot token
-PORT = 8080
-THRESHOLD = 5  # referrals needed for reward
-
-API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# ---------- CONFIG (edit here) ----------
+API_ID = 26343513               # replace with your api_id
+API_HASH = "12712c972da9bdf5225f63a628e1b7a3"  # replace with your api_hash
+BOT_TOKEN = "8536505559:AAHtlNxU0XS2FW4yw--0JXNA7OrZqkI4_W8"  # replace with your bot token (from BotFather)
+ADMIN_ID = 6743586157           # admin user id (change if needed)
+THRESHOLD = 5                   # referrals needed to get reward
 DB_PATH = "referral.db"
+# ---------------------------------------
 
-app = Flask(__name__)
+if BOT_TOKEN.startswith("PUT_YOUR"):
+    print("WARNING: BOT_TOKEN is placeholder. Replace BOT_TOKEN in bot.py before running.")
+if not API_ID or not API_HASH:
+    print("WARNING: API_ID/API_HASH may be invalid or missing.")
 
-# ---------- Database ----------
-def get_db():
+# ---------- DB helpers ----------
+def get_db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    conn = get_db()
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            started_from INTEGER,
-            started_at INTEGER
-        )
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        started_from INTEGER,
+        started_at INTEGER
+    );
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            referred_id INTEGER,
-            ts INTEGER,
-            UNIQUE(referrer_id, referred_id)
-        )
+    CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER,
+        ts INTEGER,
+        UNIQUE(referrer_id, referred_id)
+    );
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS rewards (
-            user_id INTEGER PRIMARY KEY,
-            rewarded INTEGER DEFAULT 0,
-            code TEXT
-        )
+    CREATE TABLE IF NOT EXISTS rewards (
+        user_id INTEGER PRIMARY KEY,
+        rewarded INTEGER DEFAULT 0,
+        code TEXT
+    );
     """)
     conn.commit()
     conn.close()
 
 init_db()
 
-# ---------- Telegram Helpers ----------
-def tg_request(method, payload=None):
-    try:
-        url = f"{API_URL}/{method}"
-        if payload:
-            r = requests.post(url, json=payload, timeout=10)
-        else:
-            r = requests.get(url, timeout=10)
-        return r.json()
-    except Exception as e:
-        print("Telegram error:", e)
-        return None
+# ---------- Utility ----------
+def gen_code():
+    return "REWARD-" + uuid.uuid4().hex[:10].upper()
 
-def tg_send(chat_id, text):
-    tg_request("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+def get_bot_username(app: Client):
+    me = app.get_me()
+    return me.username if me and me.username else "your_bot"
 
-def get_bot_username():
-    res = tg_request("getMe")
-    if res and res.get("ok"):
-        return res["result"]["username"]
-    return "unknown_bot"
+# ---------- Bot ----------
+app = Client("referral-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ---------- Referral System ----------
-def handle_start(user, ref_param):
-    uid = user["id"]
-    conn = get_db()
+# When a new user clicks deep link: /start <param>
+@app.on_message(filters.command("start"))
+async def start_handler(client: Client, message: Message):
+    args = message.text.split()
+    uid = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name or ""
+
+    # store user if new
+    conn = get_db_conn()
     cur = conn.cursor()
-
-    cur.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    cur.execute("SELECT * FROM users WHERE user_id = ?", (uid,))
     if cur.fetchone():
-        conn.close()
-        return
-
-    referrer_id = None
-    if ref_param and ref_param.isdigit():
-        referrer_id = int(ref_param)
-        if referrer_id == uid:
-            referrer_id = None
-
-    ts = int(time.time())
-    cur.execute("INSERT INTO users (user_id, username, first_name, started_from, started_at) VALUES (?,?,?,?,?)",
-                (uid, user.get("username"), user.get("first_name"), referrer_id, ts))
-    conn.commit()
-
-    # record referral
-    if referrer_id:
-        cur.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, ts) VALUES (?,?,?)",
-                    (referrer_id, uid, ts))
+        # existing user — update name/username if changed
+        cur.execute("UPDATE users SET username=?, first_name=? WHERE user_id=?", (username, first_name, uid))
         conn.commit()
-        cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (referrer_id,))
-        count = cur.fetchone()["c"]
+    else:
+        # new user; may have started from ref param
+        started_from = None
+        if len(args) > 1:
+            param = args[1]
+            # support verify_ style tokens or numeric referrer id
+            if param.startswith("verify_"):
+                # not used for referrals here, skip
+                started_from = None
+            else:
+                if param.isdigit():
+                    started_from = int(param)
+                    if started_from == uid:
+                        started_from = None
+        ts = int(time.time())
+        cur.execute("INSERT INTO users (user_id, username, first_name, started_from, started_at) VALUES (?,?,?,?,?)",
+                    (uid, username, first_name, started_from, ts))
+        conn.commit()
 
-        # reward check
-        if count >= THRESHOLD:
-            cur.execute("SELECT * FROM rewards WHERE user_id=?", (referrer_id,))
-            r = cur.fetchone()
-            if not r or r["rewarded"] == 0:
-                code = "REWARD-" + uuid.uuid4().hex[:8].upper()
-                cur.execute("INSERT OR REPLACE INTO rewards (user_id, rewarded, code) VALUES (?,?,?)",
-                            (referrer_id, 1, code))
+        # if there is a valid referrer, register referral
+        if started_from:
+            # ensure referrer exists in users table
+            cur.execute("SELECT * FROM users WHERE user_id = ?", (started_from,))
+            if cur.fetchone():
+                cur.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, ts) VALUES (?,?,?)",
+                            (started_from, uid, ts))
                 conn.commit()
-                tg_send(referrer_id, f"🎉 Aapke {THRESHOLD} referrals complete hue!\nReward Code: <b>{code}</b>")
+                # check count and award if threshold reached
+                cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id = ?", (started_from,))
+                count = cur.fetchone()["c"]
+                if count >= THRESHOLD:
+                    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (started_from,))
+                    r = cur.fetchone()
+                    if not r or r["rewarded"] == 0:
+                        code = gen_code()
+                        cur.execute("INSERT OR REPLACE INTO rewards (user_id, rewarded, code) VALUES (?,?,?)",
+                                    (started_from, 1, code))
+                        conn.commit()
+                        try:
+                            await client.send_message(started_from, f"🎉 Congratulations! You reached {THRESHOLD} referrals.\nYour reward code: <b>{code}</b>")
+                        except Exception:
+                            pass
+
+    # reply to new or existing user with their referral link & status
+    cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id = ?", (uid,))
+    row = cur.fetchone()
+    count = row["c"] if row else 0
+    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (uid,))
+    rrow = cur.fetchone()
+    reward_msg = f"✅ Reward: {rrow['code']}" if rrow and rrow["rewarded"] else f"❌ No reward yet — get {THRESHOLD} referrals"
+    bot_username = (await client.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start={uid}"
+    await message.reply_text(
+        f"👋 Hi {first_name}!\n\n"
+        f"🔗 Your referral link:\n{ref_link}\n\n"
+        f"👥 Referrals: {count}/{THRESHOLD}\n"
+        f"{reward_msg}\n\n"
+        "Share your link. Unique users who click and start via your link count as referrals."
+    )
     conn.close()
 
-def process_message(msg):
-    text = msg.get("text", "")
-    user = msg.get("from", {})
-    uid = user.get("id")
-
-    if not uid or not text:
-        return
-
-    if text.startswith("/start"):
-        parts = text.split()
-        ref_param = parts[1] if len(parts) > 1 else None
-        handle_start(user, ref_param)
-
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,))
-        count = cur.fetchone()["c"]
-        cur.execute("SELECT * FROM rewards WHERE user_id=?", (uid,))
-        rw = cur.fetchone()
-        reward = rw["code"] if rw and rw["rewarded"] else None
-        conn.close()
-
-        bot_username = get_bot_username()
-        ref_link = f"https://t.me/{bot_username}?start={uid}"
-
-        msg_text = (
-            f"👋 Hi <b>{user.get('first_name','')}</b>!\n\n"
-            f"🔗 Referral Link:\n{ref_link}\n\n"
-            f"👥 Referrals: {count}/{THRESHOLD}\n"
-            f"🎁 Reward: {'✅ ' + reward if reward else '❌ Not yet'}\n\n"
-            "Invite 5 friends to unlock your reward!"
-        )
-        tg_send(uid, msg_text)
-
-# ---------- Polling Thread ----------
-def polling_loop():
-    print("🤖 Polling started...")
-    offset = None
-    while True:
-        try:
-            updates = tg_request("getUpdates", {"offset": offset, "timeout": 30})
-            if updates and updates.get("ok"):
-                for upd in updates["result"]:
-                    offset = upd["update_id"] + 1
-                    if "message" in upd:
-                        process_message(upd["message"])
-        except Exception as e:
-            print("Polling error:", e)
-        time.sleep(2)
-
-# ---------- Dummy Web ----------
-@app.route("/")
-def home():
-    conn = get_db()
+# Admin: get stats
+@app.on_message(filters.command("stats") & filters.user(ADMIN_ID))
+async def stats_cmd(client: Client, message: Message):
+    conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT u.user_id, u.username, COUNT(r.id) as count, COALESCE(w.code,'-') as code
-        FROM users u
-        LEFT JOIN referrals r ON u.user_id=r.referrer_id
-        LEFT JOIN rewards w ON u.user_id=w.user_id
-        GROUP BY u.user_id
-        ORDER BY count DESC LIMIT 20
-    """)
-    rows = cur.fetchall()
+    cur.execute("SELECT COUNT(*) as u FROM users")
+    users = cur.fetchone()["u"]
+    cur.execute("SELECT COUNT(*) as r FROM referrals")
+    refs = cur.fetchone()["r"]
+    cur.execute("SELECT COUNT(*) as w FROM rewards WHERE rewarded=1")
+    rewarded = cur.fetchone()["w"]
     conn.close()
+    await message.reply_text(f"📊 Stats:\nUsers: {users}\nReferrals recorded: {refs}\nRewards granted: {rewarded}")
 
-    html = """
-    <html><head><title>Referral Bot</title></head><body>
-    <h1>Referral Bot Dummy Web</h1>
-    <p>This is a fake dashboard to keep your bot alive (port 8080).</p>
-    <table border=1 cellpadding=5>
-    <tr><th>User ID</th><th>Username</th><th>Referrals</th><th>Reward</th></tr>
-    {% for r in rows %}
-    <tr><td>{{r.user_id}}</td><td>{{r.username}}</td><td>{{r.count}}</td><td>{{r.code}}</td></tr>
-    {% endfor %}
-    </table>
-    <p style="color:gray;font-size:12px;">Running 24x7 - Polling Mode</p>
-    </body></html>
-    """
-    return render_template_string(html, rows=rows)
+# Admin: grant reward manually
+@app.on_message(filters.command("grant") & filters.user(ADMIN_ID))
+async def grant_cmd(client: Client, message: Message):
+    # usage: /grant <user_id>
+    args = message.text.split()
+    if len(args) < 2:
+        await message.reply_text("Usage: /grant <user_id>")
+        return
+    try:
+        uid = int(args[1])
+    except ValueError:
+        await message.reply_text("Invalid user_id.")
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (uid,))
+    r = cur.fetchone()
+    if r and r["rewarded"]:
+        await message.reply_text("User already rewarded.")
+        conn.close()
+        return
+    code = gen_code()
+    cur.execute("INSERT OR REPLACE INTO rewards (user_id, rewarded, code) VALUES (?,?,?)", (uid, 1, code))
+    conn.commit()
+    conn.close()
+    try:
+        await client.send_message(uid, f"🎁 Admin granted a reward: <b>{code}</b>")
+    except Exception:
+        pass
+    await message.reply_text(f"Granted reward to {uid}: {code}")
 
-# ---------- Run ----------
+# Optional: command to view own referrals (simple)
+@app.on_message(filters.command("myrefs"))
+async def myrefs(client: Client, message: Message):
+    uid = message.from_user.id
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as c FROM referrals WHERE referrer_id = ?", (uid,))
+    c = cur.fetchone()["c"]
+    cur.execute("SELECT * FROM rewards WHERE user_id = ?", (uid,))
+    r = cur.fetchone()
+    reward = r["code"] if r and r["rewarded"] else None
+    conn.close()
+    await message.reply_text(f"👥 You have {c} referrals.\nReward: {reward if reward else 'Not yet'}")
+
+# Run the bot
 if __name__ == "__main__":
-    threading.Thread(target=polling_loop, daemon=True).start()
-    print("✅ Bot & dummy web running on port", PORT)
-    app.run(host="0.0.0.0", port=PORT)
+    print("✅ Referral bot (Pyrogram) starting...")
+    app.run()
